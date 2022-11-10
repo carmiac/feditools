@@ -8,207 +8,317 @@ import concurrent.futures
 import random
 from threading import Lock
 import time
-
+import yaml
+import os
 from mastodon import Mastodon
+import signal
 
-# TODO: Better handle timeouts and ctrl-c
-# TODO: Add a way to save partial results to disk and resume from them
-# TODO: Add a way to save the results to a database?
-# TODO: Improve graph visualization
-
-
-def get_instance_info_and_peers(url, timeout=10):
-    # Create a new mastodon client with timeout if requested.
-    if timeout:
-        mastodon = Mastodon(api_base_url=url, request_timeout=timeout)
-    else:
-        mastodon = Mastodon(api_base_url=url)
-    try:
-        instance = mastodon.instance()
-    except Exception as e:
-        # print(f"Error: {url} generated an exception: {e} while getting instance info.")
-        instance = None
-    try:
-        peers = mastodon.instance_peers()
-    except Exception as e:
-        # print(f"Error: {url} generated an exception: {e} while getting peers.")
-        peers = None
-    return instance, peers
+# TODO: Add a way resume a scan from a previous run.
+# TODO: Better progress bar
+# TODO: Improve visualization - probably seperate tool
 
 
-progress_info = {
-    "tasks_total": 0,
-    "tasks_completed": 0,
-    "start_time": 0,
-    "progress_lock": Lock(),
-}
+class MastodonScanner:
+    def __init__(
+        self,
+        host_limit=None,
+        peer_limit=None,
+        verbose=False,
+        progress=False,
+        workers=None,
+        timeout=300,
+    ):
+        self.starting_hosts = set()
+        self.host_limit = host_limit
+        self.peer_limit = peer_limit
+        self.verbose = verbose
+        self.progress = progress
+        self.workers = workers
+        self.timeout = timeout
+        self.peer_results = {}  # {host: [peer1, peer2, ...], ...}
+        self.instance_info = {}  # {host: instance_info, ...}
+        self.start_time = None
+        self.end_time = None
+        self.scans_total = 0  # Total number of scans to perform, either host_limit or len(peers_scanned) + len(hosts_to_scan)
+        self.scans_completed = 0  # Number of scans completed successfully
+        self.scans_failed = 0  # Number of scans that failed (timeout, etc)
+        self.scans_remaining = 0  # Number of scans remaining to be completed, either host_limit - scans_completed or len(hosts_to_scan)
+        self.scans_this_round = 0  # Number of scans to perform this round
+        self.keep_scanning = False  # Whether to keep scanning or not
+        self._scan_futures = []  # List of futures for the current round of scans
+        self._unscanned_hosts = set()  # {host1, host2, ...}
 
-
-# Print status updates as the scan progresses
-def progress_indicator(future):
-    global progress_info
-    with progress_info["progress_lock"]:
-        # Get the host name from the future.
-        instance, peers = future.result()
-        if instance:
-            host = instance["uri"]
-        else:
-            host = "No instance info"
+    def _get_instance_info_and_peers(self, url):
+        """Get instance info and peers from a single mastodon instance."""
+        mastodon = Mastodon(api_base_url=url, request_timeout=self.timeout)
         try:
-            remaining_time = (
-                (time.time() - progress_info["start_time"])
-                / progress_info["tasks_completed"]
-                * (progress_info["tasks_total"] - progress_info["tasks_completed"])
-            )
-        except ZeroDivisionError:
-            remaining_time = 0
-        print(
-            f"{progress_info['tasks_completed']}/{progress_info['tasks_total']} hosts scanned. ",
-            end="",
+            instance = mastodon.instance()
+        except Exception as e:
+            if self.verbose:
+                print(f"Failed to get instance info from {url}: {e}")
+            instance = None
+        try:
+            peers = mastodon.instance_peers()
+        except Exception as e:
+            if self.verbose:
+                print(f"Failed to get peers from {url}: {e}")
+            peers = None
+        return instance, peers
+
+    def _print_progress_update(self, host):
+        """Print current scanning progress."""
+        self.elapsed_time = time.time() - self.start_time
+        time_per_task = (
+            self.elapsed_time / self.scans_completed if self.scans_completed else 0
         )
-        print(
-            f"Elapsed: {time.time() - progress_info['start_time']:.1f} sec  ",
-            end="",
-        )
-        print(f"Est remaining: {remaining_time:.1f} seconds.  ", end="")
+        time_remaining = time_per_task * self.scans_remaining
+
+        print(f"Scanned: {self.scans_completed} ", end="")
+        print(f"P Results: {len(self.peer_results)} ", end="")
+        print(f"I Results: {len(self.instance_info)} ", end="")
+        print(f"Failed: {self.scans_failed} ", end="")
+        print(f"Remaining: {self.scans_remaining} ", end="")
+        print(f"Est Remaining Time: {time_remaining:.1f} seconds ", end="")
         print(f"Host: {host}")
 
-
-def scan(url, host_limit=0, peer_limit=0, verbose=False, workers=None, timeout=None):
-    global progress_info
-    progress_info["start_time"] = time.time()
-    # Create an initial set of hosts to scan
-    hosts_to_scan = set(url)
-    # Create empty dicts to store the peer results and the instance info
-    peer_results = {}
-    instance_info = {}
-    # Start scanning the network.
-    # We will use a thread pool executor to scan the network in parallel.
-    while hosts_to_scan:
-        if verbose:
-            print(f"Total known unscanned hosts: {len(hosts_to_scan)}")
-            print(f"Total scanned hosts: {len(peer_results)}")
-        # Get the hosts for the next round of scanning.
-        hosts = set()
-        if host_limit:
-            for i in range(min(len(hosts_to_scan), host_limit - len(peer_results))):
-                hosts.add(hosts_to_scan.pop())
+    def _get_hosts_for_round(self):
+        if self.host_limit:
+            hosts_this_round = set()
+            while (
+                len(hosts_this_round) < (self.host_limit - len(self.peer_results))
+                and self._unscanned_hosts
+            ):
+                hosts_this_round.add(self._unscanned_hosts.pop())
+            self.scans_this_round = len(hosts_this_round)
+            self.scans_remaining_this_round = self.scans_this_round
+            self.scans_remaining = self.host_limit - len(self.peer_results)
+            self.scans_total = len(self.peer_results) + self.scans_remaining
         else:
-            hosts = hosts_to_scan
-            hosts_to_scan = set()
-        if verbose:
-            print(f"Scanning {len(hosts)} hosts")
-        with progress_info["progress_lock"]:
-            progress_info["tasks_total"] = host_limit if host_limit else len(hosts)
-            progress_info["tasks_completed"] = len(peer_results)
-        # Scan the hosts in parallel using concurrent.futures.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(get_instance_info_and_peers, host, timeout): host
-                for host in hosts
-            }
-            for future in futures:
-                future.add_done_callback(progress_indicator)
-            try:
-                for future in concurrent.futures.as_completed(futures, timeout=timeout):
-                    host = futures[future]
-                    try:
-                        instance, peers = future.result()
-                    except Exception as exc:
-                        print(f"Error: {host} generated an exception: {exc}")
-                    else:
-                        if peers:
-                            # Limit the number of peers if requested.
-                            if peer_limit:
-                                peers = random.sample(
-                                    peers, min(peer_limit, len(peers))
-                                )
-                            # Add the peers to the results and the hosts to scan.
-                            peer_results[host] = peers
-                            for peer in peers:
-                                if (
-                                    peer not in peer_results
-                                    and peer not in hosts_to_scan
-                                ):
-                                    hosts_to_scan.add(peer)
-                            with progress_info["progress_lock"]:
-                                progress_info["tasks_completed"] = len(peer_results)
-                        if instance:
-                            instance_info[host] = instance
-            except concurrent.futures.TimeoutError:
-                if verbose:
-                    print("Timeout Error: One or more hosts timed out.")
-        # Check if we reached the host limit
-        if host_limit and len(peer_results) >= host_limit:
-            break
+            hosts_this_round = self._unscanned_hosts
+            self._unscanned_hosts = set()
+            self.scans_this_round = len(hosts_this_round)
+            self.scans_remaining_this_round = self.scans_this_round
+            self.scans_remaining = self.scans_this_round + len(self._unscanned_hosts)
+            self.scans_total = len(self.peer_results) + self.scans_remaining
+        return hosts_this_round
 
-    return instance_info, peer_results
+    def cancel_scan(self):
+        """Cancel the current round of scans."""
+        self.keep_scanning = False
+        for future in self._scan_futures:
+            future.cancel()
+
+    def scan(self, host_list):
+        self.start_time = time.time()
+        self.keep_scanning = True
+        # Create an initial set of hosts to scan
+        self._unscanned_hosts = set(host_list)
+        self.starting_hosts = set(host_list)
+        # Start scanning the set of unscanned hosts.
+        while self._unscanned_hosts and self.keep_scanning:
+            if self.verbose:
+                print(f"Total known unscanned hosts: {len(self._unscanned_hosts)}")
+                print(f"Total scanned hosts: {len(self.peer_results)}")
+            # Get the hosts for this round of scanning and update task counters.
+            hosts_this_round = self._get_hosts_for_round()
+            # Print the current progress.
+            if self.verbose:
+                print(f"Scanning {self.scans_this_round} hosts this round.")
+                print(f"Total scans remaining: {self.scans_remaining}")
+                print(f"Total scans to perform: {self.scans_total}")
+
+            # Scan the hosts in parallel using concurrent.futures.
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.workers
+            ) as executor:
+                self._scan_futures = {
+                    executor.submit(self._get_instance_info_and_peers, host): host
+                    for host in hosts_this_round
+                }
+                try:
+                    for future in concurrent.futures.as_completed(
+                        self._scan_futures, timeout=self.timeout
+                    ):
+                        host = self._scan_futures[future]
+                        self.scans_remaining_this_round -= 1
+                        try:
+                            instance, peers = future.result()
+                        except Exception as exc:
+                            self.scans_failed += 1
+                            if self.verbose:
+                                print(f"Error: {host} generated an exception: {exc}")
+                        else:
+                            self.scans_completed += 1
+                            self.process_scan_result(host, instance, peers)
+                        if self.progress:
+                            self._print_progress_update(host)
+                except concurrent.futures.TimeoutError:
+                    # Count the remaining tasks as failed.
+                    self.scans_failed += self.scans_remaining_this_round
+                    if self.verbose:
+                        print(
+                            f"Timeout Error:{self.scans_remaining_this_round} hosts timed out."
+                        )
+            # Check if we reached the host limit.
+            if self.host_limit and len(self.peer_results) >= self.host_limit:
+                if self.verbose:
+                    print(f"Reached host limit of {self.host_limit}")
+                break
+        self.end_time = time.time()
+
+    def process_scan_result(self, host, instance, peers):
+        """Process the results of a single scan."""
+        if not peers and not instance:
+            self.scans_failed += 1
+            return
+        if peers:
+            self.scans_remaining -= 1
+            if self.verbose:
+                print(f"{host} has {len(peers)} peers")
+            # Limit the number of peers if requested.
+            if self.peer_limit:
+                peers = random.sample(peers, min(self.peer_limit, len(peers)))
+            # Add the peers to the results and the hosts to scan.
+            self.peer_results[host] = peers
+            for peer in peers:
+                if peer not in self.peer_results:
+                    self._unscanned_hosts.add(peer)
+        else:
+            if self.verbose:
+                print(f"{host} has no peers")
+        if instance:
+            self.instance_info[host] = instance
+
+
+def write_results_to_file(scanner, directory):
+    """Write the results of the scan to several files."""
+    # Create the directory if it doesn't exist.
+    os.makedirs(directory, exist_ok=True)
+    # Write the run metadata to a file.
+    with open(os.path.join(directory, "run_metadata.yaml"), "w") as f:
+        yaml.dump(
+            {
+                "starting_hosts": scanner.starting_hosts,
+                "start_time": scanner.start_time,
+                "end_time": scanner.end_time,
+                "elapsed_time": scanner.end_time - scanner.start_time,
+                "host_limit": scanner.host_limit,
+                "peer_limit": scanner.peer_limit,
+                "workers": scanner.workers,
+                "timeout": scanner.timeout,
+                "verbose": scanner.verbose,
+                "scans_completed": scanner.scans_completed,
+                "scans_failed": scanner.scans_failed,
+                "scans_remaining": scanner.scans_remaining,
+                "scans_total": scanner.scans_total,
+                "hosts_with_peers": len(scanner.peer_results),
+                "hosts_with_instance_info": len(scanner.instance_info),
+            },
+            f,
+            indent=4,
+        )
+    # Write the peer results to a file.
+    with open(os.path.join(directory, "peers.csv"), "w", encoding="utf-8") as f:
+        # Write the results in a CSV format that can be used by networkx
+        f.write("source,target\n")
+        for host, peers in scanner.peer_results.items():
+            for peer in peers or []:
+                f.write(f"{host},{peer}\n")
+    # Write the instance info to a file.
+    with open(os.path.join(directory, "instances.yaml"), "w", encoding="utf-8") as f:
+        yaml.dump(scanner.instance_info, f, indent=4)
+
+
+def print_stats(scanner):
+    """Print the results of the scan."""
+    print(f"Scan completed in {scanner.end_time - scanner.start_time:.1f} seconds.")
+    hosts = set()
+    for host, peers in scanner.peer_results.items():
+        if peers:
+            hosts.add(host)
+    for host, instance in scanner.instance_info.items():
+        if instance:
+            hosts.add(host)
+    print(f"Scanned {len(hosts)} total unique hosts.")
+    print(f"Total hosts with instance info: {len(scanner.instance_info)}")
+    print(f"Total hosts with peer info: {len(scanner.peer_results)}")
+    print(f"Total scans completed: {scanner.scans_completed}")
+    print(f"Total scans failed: {scanner.scans_failed}")
+    print(f"Total scans remaining: {scanner.scans_remaining}")
+    print(f"Total scans attempted: {scanner.scans_total}")
+
+
+def print_results(scanner):
+    hosts = set()
+    for host, peers in scanner.peer_results.items():
+        if peers:
+            hosts.add(host)
+    for host, instance in scanner.instance_info.items():
+        if instance:
+            hosts.add(host)
+    for host in hosts:
+        print(f"Host: {host}")
+        if host in scanner.instance_info:
+            print(f"  Instance Info:")
+            print(f"    URI: {scanner.instance_info[host]['uri']}")
+            print(f"    Title: {scanner.instance_info[host]['title']}")
+            print(f"    Description: {scanner.instance_info[host]['description']}")
+            print(f"    Email: {scanner.instance_info[host]['email']}")
+            print(f"    Version: {scanner.instance_info[host]['version']}")
+            print(f"    Stats:")
+            print(
+                f"      User Count: {scanner.instance_info[host]['stats']['user_count']}"
+            )
+            print(
+                f"      Status Count: {scanner.instance_info[host]['stats']['status_count']}"
+            )
+            print(
+                f"      Domain Count: {scanner.instance_info[host]['stats']['domain_count']}"
+            )
+        if host in scanner.peer_results:
+            print(f"  Peers for host: {host}")
+            for peer in peers or ["No peers found"]:
+                print(f"\t{peer}")
 
 
 def main(args):
-    print(f"Starting scanning the mastodon federation network from urls: {args.url}")
-    instance_info, peer_results = scan(
-        url=args.url,
+    print(f"Scanning the mastodon federation network starting from: {args.host_list}")
+    scanner = MastodonScanner(
         host_limit=args.host_limit,
         peer_limit=args.peer_limit,
         verbose=args.verbose,
+        progress=args.progress,
         workers=args.workers,
         timeout=args.timeout,
     )
+    # Create a sigterm handler to stop the scanner and register it.
+    def sigterm_handler(_signo, _stack_frame):
+        print(f"Stopping scanner. This may take up to {args.timeout} seconds.")
+        scanner.cancel_scan()
+
+    signal.signal(signal.SIGINT, sigterm_handler)
+
+    scanner.scan(args.host_list)
+
+    print(f"Done!")
+    if args.stats:
+        print_stats(scanner)
+    if args.results:
+        print_results(scanner)
 
     # Output the results in a nice format that can be used by other programs.
-    # In particular, we should output the results in a format that can be used by
-    # the networkx library to create a graph of the network.
-    if args.csv:
-        with open(args.output, "w") as f:
-            # Write the results in a CSV format that can be used by networkx
-            f.write("source,target")
-            for host, peers in peer_results.items():
-                for peer in peers or []:
-                    f.write(f"{host},{peer}")
-
-    # Get set of all hosts that returned either peers or instance info
-    hosts = set()
-    for host, peers in peer_results.items():
-        if peers:
-            hosts.add(host)
-    for host, instance in instance_info.items():
-        if instance:
-            hosts.add(host)
-    print(f"Scan complete. Total hosts with peers or instance info: {len(hosts)}")
-    if args.print:
-        # For each host, print the instance info and the peers
-        for host in hosts:
-            print(f"Host: {host}")
-            if host in instance_info:
-                print(f"  Instance Info:")
-                print(f"    URI: {instance_info[host]['uri']}")
-                print(f"    Title: {instance_info[host]['title']}")
-                print(f"    Description: {instance_info[host]['description']}")
-                print(f"    Email: {instance_info[host]['email']}")
-                print(f"    Version: {instance_info[host]['version']}")
-                print(f"    Stats:")
-                print(f"      User Count: {instance_info[host]['stats']['user_count']}")
-                print(
-                    f"      Status Count: {instance_info[host]['stats']['status_count']}"
-                )
-                print(
-                    f"      Domain Count: {instance_info[host]['stats']['domain_count']}"
-                )
-            if host in peer_results:
-                print(f"  Peers for host: {host}")
-                for peer in peers or ["No peers found"]:
-                    print(f"\t{peer}")
+    if args.output:
+        print(f"Writing results to {args.output}")
+        write_results_to_file(scanner, args.output)
 
     # Create a graph of the network using networkx and pyvis
     if args.graph:
         import networkx as nx
         from pyvis.network import Network
 
-        G = nx.from_dict_of_lists(peer_results, create_using=nx.DiGraph)
+        G = nx.from_dict_of_lists(scanner.peer_results, create_using=nx.DiGraph)
         net = Network(notebook=False)
         net.from_nx(G)
-        net.show_buttons(filter_=["physics"])
         net.show("test.html")
 
 
@@ -216,7 +326,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Mastodon Network Analyzer")
     parser.add_argument("-v", "--verbose", help="Verbose mode.", action="store_true")
     parser.add_argument(
-        "url", type=str, nargs="+", help="Starting Mastodon instance URLs"
+        "host_list",
+        type=str,
+        nargs="+",
+        help="Starting Mastodon hosts, e.g. mas.to mastodon.social",
     )
     parser.add_argument(
         "--host_limit",
@@ -242,9 +355,25 @@ if __name__ == "__main__":
         help="Timeout for mastodon connections in seconds. Default %(default)s",
         default=30,
     )
-    parser.add_argument("--csv", type=str, help="Output CSV file name.", default=None)
-    parser.add_argument("--print", help="Print the results", action="store_true")
+    parser.add_argument(
+        "--output", type=str, help="Output run data to given directory.", default=None
+    )
+    parser.add_argument(
+        "--stats",
+        help="Print run stats default: %(default)s",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--progress",
+        help="Print progress default: %(default)s",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    parser.add_argument("--results", help="Print run results", action="store_true")
     parser.add_argument("--graph", help="Graph the network", action="store_true")
+
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
 

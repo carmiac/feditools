@@ -127,3 +127,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+test_run/instances.yaml
+test_run/peers.csv
+test_run/run_metadata.yaml
